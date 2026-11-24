@@ -1,0 +1,118 @@
+name: Sync Upstream Resources
+
+on:
+  # 每天北京时间凌晨 03:30 自动检查
+  schedule:
+    - cron: "30 3 * * *"
+      timezone: "Asia/Shanghai"
+
+  # 支持手动触发
+  workflow_dispatch:
+
+# 允许自动提交和推送
+permissions:
+  contents: write
+
+# 防止多个同步任务同时运行
+concurrency:
+  group: sync-upstream-resources
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 获取自己的仓库
+      - name: Checkout My Repository
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          path: repo
+          fetch-depth: 1
+
+      # 2. 获取第一个上游仓库的 resources/sr
+      - name: Checkout Upstream SR
+        uses: actions/checkout@v7
+        with:
+          repository: ctrlcvs/xiaoyao-cvs-plugin
+          ref: master
+          path: .upstream/xiaoyao-cvs-plugin
+          sparse-checkout: |
+            resources/sr
+          sparse-checkout-cone-mode: true
+          fetch-depth: 1
+
+      # 3. 获取第二个上游仓库的全部内容
+      - name: Checkout Upstream Xiaoyao Plus
+        uses: actions/checkout@v7
+        with:
+          repository: ctrlcvs/xiaoyao_plus
+          ref: main
+          path: .upstream/xiaoyao_plus
+          fetch-depth: 1
+
+      # 4. 同步两个文件夹
+      - name: Sync Upstream Resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SR_SOURCE=".upstream/xiaoyao-cvs-plugin/resources/sr"
+          PLUS_SOURCE=".upstream/xiaoyao_plus"
+
+          SR_TARGET="repo/resources/sr"
+          PLUS_TARGET="repo/resources/xiaoyao-plus"
+
+          # 检查第一个上游文件夹
+          if [[ ! -d "$SR_SOURCE" ]]; then
+            echo "::error::Upstream sr folder not found!"
+            exit 1
+          fi
+
+          # 检查第二个上游仓库是否非空
+          if ! find "$PLUS_SOURCE" \
+            -mindepth 1 -maxdepth 1 \
+            ! -name ".git" -print -quit | grep -q .; then
+            echo "::error::Upstream xiaoyao_plus repository is empty!"
+            exit 1
+          fi
+
+          # 创建目标目录
+          mkdir -p "$SR_TARGET"
+          mkdir -p "$PLUS_TARGET"
+
+          # 同步 sr
+          rsync -a --delete \
+            "$SR_SOURCE/" "$SR_TARGET/"
+
+          # 同步完整 xiaoyao_plus，排除 Git 元数据
+          rsync -a --delete --exclude=".git" \
+            "$PLUS_SOURCE/" "$PLUS_TARGET/"
+
+      # 5. 自动提交并推送
+      - name: Commit and Push
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git -C repo config user.name "github-actions[bot]"
+          git -C repo config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 只提交两个同步目录
+          git -C repo add -f -A -- \
+            resources/sr \
+            resources/xiaoyao-plus
+
+          # 没有变化就不提交
+          if git -C repo diff --cached --quiet; then
+            echo "No upstream changes detected."
+            exit 0
+          fi
+
+          git -C repo commit \
+            -m "chore: sync upstream resources"
+
+          git -C repo push origin HEAD:master
+

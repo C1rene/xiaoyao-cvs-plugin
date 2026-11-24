@@ -1,0 +1,11 @@
+{
+	"sys": {
+		"help": false
+	},
+	"sr": {
+		"Search": true
+	},
+	"Atlas": {
+		"all": true
+	}
+}
