@@ -1,57 +1,53 @@
 import User from "./user.js";
 import utils from './mys/utils.js';
-import gsCfg from './gsCfg.js';
 export default class mysTopLogin {
     constructor(e) {
         this.e = e;
-        this.init();
+        this.user = new User(this.e);
         //消息提示以及风险警告
         this.sendMsgUserPassLogin = `免责声明:您将通过密码完成获取米游社sk以及ck。\n本Bot将不会保存您的账号和密码。\n我方仅提供米游社查询及相关游戏内容服务,若您的账号封禁、被盗等处罚与我方无关。\n害怕风险请勿发送账号密码~`
     }
-    async init() {
-        this.user = new User(this.e)
+    async ensureLoginDevice() {
+        const { default: DeviceManager } = await import(`file://${process.cwd()}/plugins/genshin/model/device/DeviceManager.js`);
+        let record = this.e.deviceSessionId
+            ? await DeviceManager.getLoginSession(this.e.deviceSessionId)
+            : null;
+        if (!record) {
+            const isOs = Boolean(this.e.isOs || /(?:os_|global|prod_official_(?:usa|eur|asia|cht|tw|hk|kr)|prod_gf_(?:us|usa|eu|eur|jp|sg|asia|cht|tw|hk|kr))/i.test(String(this.e.region || '')));
+            const server = isOs ? (this.e.region || 'os_usa') : 'cn_gf01';
+            const biz = isOs ? 'hk4e_global' : 'hk4e_cn';
+            record = await DeviceManager.createLoginSession('', { game: 'bbs', server, biz, isOs });
+            this.e.deviceSessionId = record.sessionId;
+            this.e.deviceServer = server;
+            this.e.deviceBiz = biz;
+            this.e.deviceIsOs = isOs;
+        }
+        if (!record?.deviceId || !record?.deviceFp || !record?.profile) {
+            throw new Error('Genshin 未能创建完整的临时设备档案');
+        }
+        this.e.deviceServer = record.server || this.e.deviceServer || 'cn_gf01';
+        this.e.deviceBiz = record.biz || this.e.deviceBiz || 'hk4e_cn';
+        this.e.deviceIsOs = Boolean(record.isOs || this.e.deviceIsOs);
+        this.device = record.deviceId;
+        this.e.deviceId = record.deviceId;
+        this.e.deviceFp = record.deviceFp;
+        this.e.deviceProfile = record.profile;
+        return record;
     }
-    //
+
     async qrCodeLogin() {
         let RedisData = await utils.redisGet(this.e.user_id, "GetQrCode")
         if (RedisData) {
             this.e.reply([segment.at(this.e.user_id), `前置二维码未扫描，请勿重复触发指令`])
             return false;
         }
-        // 同一用户的扫码会话复用配对设备身份；不再让 API 模块共享全局设备 ID。
-        let device = await utils.redisGet(this.e.user_id, 'qrDevice')
-        if (!device?.deviceId) {
-            // Redis 缺失时，优先从该 QQ 已绑定 SK 对应的 MysUser.device 恢复设备 ID。
-            try {
-                const sks = await gsCfg.getUserStoken(this.e.user_id)
-                const sk = Object.values(sks || {}).find(v => v?.stuid)
-                if (sk?.stuid) {
-                    const { default: MysUser } = await import(`file://${process.cwd()}/plugins/genshin/model/mys/MysUser.js`)
-                    const mysUser = await MysUser.create(sk.stuid)
-                    if (mysUser?.device) device = { deviceId: mysUser.device }
-                }
-            } catch (error) {
-                Bot.logger.debug(`[扫码设备] 读取已有设备失败：${error.message}`)
-            }
-        }
-        if (!device?.deviceId) device = { deviceId: utils.randomString(32).toUpperCase() }
-        if (!device.deviceFp) {
-            // 尝试复用 Genshin 已有的账号级 FP；首次登录时使用参考插件采用的默认 FP，
-            // 成功绑定 CK 后再调用其设备指纹生成逻辑更新。
-            try {
-                const sks = await gsCfg.getUserStoken(this.e.user_id)
-                const sk = Object.values(sks || {}).find(v => v?.stuid)
-                if (sk?.stuid) device.deviceFp = await redis.get(`genshin:device_fp:${sk.stuid}:fp`) || await redis.get(`ZZZ:DEVICE_FP:${sk.stuid}:FP`)
-            } catch {}
-            device.deviceFp = device.deviceFp || '38d805c20d53d'
-        }
-        await utils.redisSet(this.e.user_id, 'qrDevice', device, 60 * 60 * 24 * 30)
-        this.device = device.deviceId
-        this.e.deviceId = device.deviceId
-        this.e.deviceFp = device.deviceFp
+        await this.ensureLoginDevice();
         let res = await this.user.getData("qrCodeLogin", {
-            device: this.device
-        },false)
+            device: this.device,
+            deviceId: this.e.deviceId,
+            deviceFp: this.e.deviceFp,
+            deviceProfile: this.e.deviceProfile
+        }, false)
         if (!res.data) {
             return false;
         }
@@ -156,6 +152,8 @@ export default class mysTopLogin {
             mid,
             deviceId: this.device,
             deviceFp: this.e.deviceFp,
+            deviceProfile: this.e.deviceProfile,
+            deviceSessionId: this.e.deviceSessionId,
             stoken
         }
     }
@@ -165,6 +163,7 @@ export default class mysTopLogin {
         this.e.reply(`请将账号密码用逗号隔开私聊发送以完成绑定\n例：账号xxx@qq.com,密码xxxxx`)
     }
     async UserPassLogin() {
+        await this.ensureLoginDevice();
         let msg = this.e.msg.replace(/账号|密码|：|:/g, '').replace(/,|，/, ',').split(',');
         if (msg.length != 2) {
             return false;
@@ -189,7 +188,11 @@ export default class mysTopLogin {
             const cookieTokenValue = cookie_token?.data?.cookie_token || cookie_token?.data?.token?.token
             return {
                 cookie: utils.buildV2Cookie({ ltuid: accountId, ltoken: ltokenValue, cookieToken: cookieTokenValue, mid }),
-                stoken: `${cookies.replace('&', ';')};stuid=${accountId};`
+                stoken: `${cookies.replace('&', ';')};stuid=${accountId};`,
+                deviceId: this.device,
+                deviceFp: this.e.deviceFp,
+                deviceProfile: this.e.deviceProfile,
+                deviceSessionId: this.e.deviceSessionId
             }
         } else {
             await this.e.reply(`登录失败：${res?.message || '接口返回异常'}（retcode=${res?.retcode ?? 'unknown'}）`, true)

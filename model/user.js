@@ -274,13 +274,17 @@ export default class user {
                     const option = {
                         game: 'bbs',
                         device: this.e.deviceId || undefined,
+                        deviceFp: this.e.deviceFp || undefined,
+                        deviceProfile: this.e.deviceProfile || undefined,
                         log: false
                     };
-                    const queryData = { game_biz: game.biz }; // 同时区分 Genshin MysApi 的角色查询缓存键
-                    // 将扫码阶段的设备身份直接交给 Genshin 请求层，避免它另行生成设备 ID/FP。
-                    if (this.e.deviceId) queryData.deviceId = this.e.deviceId;
-                    if (this.e.deviceFp) {
-                        queryData.deviceFp = this.e.deviceFp;
+                    const queryData = {
+                        game_biz: game.biz,
+                        deviceId: this.e.deviceId,
+                        deviceFp: this.e.deviceFp,
+                        deviceProfile: this.e.deviceProfile
+                    }; // Passport 登录期间始终使用同一份 Genshin 临时设备档案
+                    if (this.e.deviceId && this.e.deviceFp) {
                         queryData.headers = {
                             'x-rpc-device_id': this.e.deviceId,
                             'x-rpc-device_fp': this.e.deviceFp

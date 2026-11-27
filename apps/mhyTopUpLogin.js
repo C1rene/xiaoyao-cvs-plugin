@@ -1,7 +1,6 @@
 import mys from "../model/mhyTopUpLogin.js"
 import Common from "../components/Common.js";
 import { bindStoken } from './user.js'
-import utils from '../model/mys/utils.js';
 import {
 	Cfg,
 } from "../components/index.js";
@@ -114,6 +113,8 @@ export async function UserPassLogin(e) {
 export async function bindSkCK(e, res) {
 	e.deviceId = res?.deviceId || e.deviceId
 	e.deviceFp = res?.deviceFp || e.deviceFp
+	e.deviceProfile = res?.deviceProfile || e.deviceProfile
+	e.deviceSessionId = res?.deviceSessionId || e.deviceSessionId
 	// 将扫码阶段已经成功交换的 Ltoken 一并交给 SK 绑定流程，避免再次请求失败后丢失。
 	const skText = [res?.stoken, res?.ltoken ? `ltoken=${res.ltoken}` : ''].filter(Boolean).join(';')
 	e.msg = skText, e.raw_message = skText
@@ -127,27 +128,37 @@ export async function bindSkCK(e, res) {
 	if (!skBound) await e.reply('Cookie 已绑定，但 Stoken 角色查询或保存失败。请查看 [SK绑定]/[SK角色查询] 日志；已获取的 Stoken 不应丢弃，可稍后重试。')
 	e.ck = res?.cookie, e.msg = res.cookie, e.raw_message = res.cookie;
 	const userck = (await import(`file://${process.cwd()}/plugins/genshin/model/user.js`)).default
-	await (new userck(e)).bing()
-	// 将扫码阶段的设备 ID 写入 Genshin MysUsers，供后续重新登录复用。
+	const ckBound = await (new userck(e)).bing()
+	// 登录成功后由 Genshin 将临时设备档案整体归档并覆盖目标 ltuid 的旧档案。
+	let stuid = String(res?.stuid || res?.stoken || '').match(/(?:stuid|uid)=(\d+)/)?.[1] || String(res?.stuid || '')
 	try {
-		const { default: MysUser } = await import(`file://${process.cwd()}/plugins/genshin/model/mys/MysUser.js`)
-		const stuid = String(res?.stoken || '').match(/(?:stuid|uid)=(\d+)/)?.[1]
-		if (stuid && e.deviceId) {
-			const mysUser = await MysUser.create(stuid)
-			if (mysUser) { mysUser.setCkData({ device: e.deviceId }); await mysUser.save() }
-			// CK 已经可用后，复用参考插件的 FP 获取逻辑，并缓存账号级 FP。
-			try {
-				const { default: getDeviceFp } = await import(`file://${process.cwd()}/plugins/genshin/model/getDeviceFp.js`)
-				const { deviceFp } = await getDeviceFp.Fp(stuid, e.ck, 'bbs')
-				if (deviceFp) {
-					const device = await utils.redisGet(e.user_id, 'qrDevice') || {}
-					device.deviceId = e.deviceId
-					device.deviceFp = deviceFp
-					await utils.redisSet(e.user_id, 'qrDevice', device, 60 * 60 * 24 * 30)
-				}
-			} catch (fpError) { Bot.logger.debug(`[扫码设备] FP 更新失败：${fpError.message}`) }
+		if (ckBound && stuid && e.deviceSessionId) {
+			const { default: DeviceManager } = await import(`file://${process.cwd()}/plugins/genshin/model/device/DeviceManager.js`)
+			await DeviceManager.completeLoginSession(e.deviceSessionId, stuid, e.ck, {
+				game: 'bbs', uid: stuid,
+				server: e.deviceServer || 'cn_gf01',
+				biz: e.deviceBiz || 'hk4e_cn',
+				isOs: Boolean(e.deviceIsOs)
+			})
+			e.deviceProfileLtuid = stuid
+			e.deviceSessionId = ''
+			Bot.logger.mark(`[扫码设备] 临时设备档案已归档到 ltuid:${stuid}`)
 		}
 	} catch (error) {
-		Bot.logger.warn(`[扫码设备] MysUsers.device 写入失败：${error.message}`)
+		Bot.logger.error(`[扫码设备] 临时设备档案归档失败，尝试由 Genshin 为账号初始化正式档案：${error.stack || error.message}`)
+		try {
+			if (stuid && e.ck) {
+				const { default: DeviceManager } = await import(`file://${process.cwd()}/plugins/genshin/model/device/DeviceManager.js`)
+				await DeviceManager.getForAccount(stuid, e.ck, {
+					game: 'bbs', uid: stuid,
+					server: e.deviceServer || 'cn_gf01',
+					biz: e.deviceBiz || 'hk4e_cn',
+					isOs: Boolean(e.deviceIsOs)
+				})
+				e.deviceSessionId = ''
+			}
+		} catch (fallbackError) {
+			Bot.logger.error(`[扫码设备] 正式设备档案初始化也失败：${fallbackError.stack || fallbackError.message}`)
+		}
 	}
 }

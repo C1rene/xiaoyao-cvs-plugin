@@ -19,10 +19,12 @@ export default class miHoYoApi {
 		if (e) {
 			this.e = e
 			this.cookie = e.cookie
-		// 每个 API 实例使用稳定设备身份，避免模块级设备 ID 被所有用户共享。
-		this.deviceId = e.deviceId || e.device_id || utils.randomString(32).toUpperCase();
-		this.deviceFp = e.deviceFp || e.device_fp || '38d7ee0e96649';
-		this.deviceName = e.deviceName || 'Xiaomi 14';	
+		// 设备身份只能来自 Genshin DeviceManager；此处不生成随机 ID、不使用固定 FP。
+		this.deviceProfile = e.deviceProfile || null;
+		this.deviceId = e.deviceId || e.device_id || this.deviceProfile?.deviceId || '';
+		this.deviceFp = e.deviceFp || e.device_fp || this.deviceProfile?.deviceFp || '';
+		this.deviceName = this.deviceProfile?.deviceName || e.deviceName || '';
+
 			this.userId = String(e.user_id)
 			this.isOs = false;
 			if (this.e?.uid) {
@@ -61,7 +63,71 @@ export default class miHoYoApi {
 	}
 
 	static ckRefreshTasks = new Map();
+
+	async ensureDeviceInfo(data = {}) {
+		const { default: DeviceManager } = await import(`file://${_path}/plugins/genshin/model/device/DeviceManager.js`);
+		const sessionId = this.e?.deviceSessionId;
+		const sessionRecord = sessionId ? await DeviceManager.getLoginSession(sessionId) : null;
+		if (sessionId && !sessionRecord) throw new Error('Genshin 临时设备登录会话不存在或已过期');
+		const ltuid = await DeviceManager.getLtuid(data?.cookies, true) || await DeviceManager.getLtuid(this.cookie) || await DeviceManager.getLtuid(this.e?.cookie) || await DeviceManager.getLtuid(this.e?.cookies) || String(this.e?.stuid || '');
+		const candidateCookie = this.cookie || this.e?.cookie || '';
+		const candidateCookieLtuid = await DeviceManager.getLtuid(candidateCookie);
+		const accountCookie = candidateCookieLtuid === String(ltuid) ? candidateCookie : '';
+
+		// 仅当设备档案确实属于当前 ltuid，或当前请求仍处于同一个临时登录会话时，才复用事件对象中的缓存。
+		const profileMatchesSession = sessionId && this.deviceProfile?.profileId === sessionRecord?.profile?.profileId;
+		if (this.deviceProfile?.deviceId && this.deviceProfile?.deviceFp && sessionId && profileMatchesSession) {
+			this.deviceId = this.deviceProfile.deviceId;
+			this.deviceFp = this.deviceProfile.deviceFp;
+			this.deviceName = this.deviceProfile.deviceName || this.deviceName;
+			this.e.deviceId = this.deviceId;
+			this.e.deviceFp = this.deviceFp;
+			this.e.deviceProfile = this.deviceProfile;
+			return { deviceId: this.deviceId, deviceFp: this.deviceFp, profile: this.deviceProfile };
+		}
+
+		let record = null;
+		if (sessionId) {
+			record = sessionRecord;
+		} else if (ltuid && /^\d{4,12}$/.test(ltuid)) {
+			const isOs = Boolean(this.isOs || this.e?.isOs || String(this.e?.uid || '')[0] > '5' || /(?:os_|global|prod_official_(?:usa|eur|asia|cht|tw|hk|kr)|prod_gf_(?:us|usa|eu|eur|jp|sg|asia|cht|tw|hk|kr))/i.test(String(this.e?.region || '')));
+			record = await DeviceManager.getForAccount(ltuid, accountCookie, {
+				game: 'bbs', uid: this.e?.uid || ltuid,
+				server: isOs ? 'os_usa' : 'cn_gf01',
+				biz: isOs ? 'hk4e_global' : 'hk4e_cn', isOs
+			});
+		} else {
+			const isOs = Boolean(this.e?.isOs || /(?:os_|global|prod_official_(?:usa|eur|asia|cht|tw|hk|kr)|prod_gf_(?:us|usa|eu|eur|jp|sg|asia|cht|tw|hk|kr))/i.test(String(this.e?.region || '')));
+			const server = isOs ? (this.e?.region || 'os_usa') : 'cn_gf01';
+			const biz = isOs ? 'hk4e_global' : 'hk4e_cn';
+			record = await DeviceManager.createLoginSession('', { game: 'bbs', server, biz, isOs });
+			this.e.deviceSessionId = record.sessionId;
+			this.e.deviceServer = server;
+			this.e.deviceBiz = biz;
+			this.e.deviceIsOs = isOs;
+		}
+		if (!record?.deviceId || !record?.deviceFp || !record?.profile) {
+			throw new Error('Genshin DeviceManager 未返回完整设备档案');
+		}
+		this.deviceProfile = record.profile;
+		this.deviceId = record.deviceId;
+		this.deviceFp = record.deviceFp;
+		this.deviceName = record.profile.deviceName || '';
+		this.e.deviceId = this.deviceId;
+		this.e.deviceFp = this.deviceFp;
+		this.e.deviceProfile = this.deviceProfile;
+		this.e.deviceProfileLtuid = record.ltuid || record.profile.ltuid || '';
+		return record;
+	}
+
 	async getData(type, data = {}, refreshed = false) {
+		try {
+			await this.ensureDeviceInfo(data);
+		} catch (error) {
+			logger.error(`[Xiaoyao][DeviceManager] ${error.message}`);
+			return false;
+		}
+
 		let gameBody = this.getBody(data.name);
 		let {
 			url,
@@ -231,6 +297,21 @@ export default class miHoYoApi {
 		if (query) url += `?${query}`
 		if (body) body = JSON.stringify(body)
 		let headers = this.getHeaders(board, types, sign, body, query)
+		const profile = data?.deviceProfile || this.deviceProfile
+		if (profile) {
+			const osVersion = profile.androidVersion || '13'
+			const modelName = profile.deviceModel || 'Android'
+			const brand = profile.brand || profile.deviceFingerprint?.split('/')[0] || 'Android'
+			const buildId = profile.deviceFingerprint?.split('/')[3] || 'release'
+			headers['x-rpc-device_id'] = data?.deviceId || profile.deviceId
+			headers['x-rpc-device_fp'] = data?.deviceFp || profile.deviceFp
+			headers['x-rpc-device_name'] = profile.deviceName || `${brand} ${modelName}`
+			headers['x-rpc-device_model'] = modelName
+			headers['x-rpc-sys_version'] = osVersion
+			if (headers['User-Agent'] && !/^okhttp\//i.test(headers['User-Agent'])) {
+				headers['User-Agent'] = `Mozilla/5.0 (Linux; Android ${osVersion}; ${modelName} Build/${buildId}; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/111.0.5563.116 Mobile Safari/537.36 miHoYoBBS/${mys.APP_VERSION}`
+			}
+		}
 		return {
 			url,
 			headers,
@@ -246,7 +327,7 @@ export default class miHoYoApi {
 					'accept-language': 'zh-CN,zh;q=0.9,ja-JP;q=0.8,ja;q=0.7,en-US;q=0.6,en;q=0.5',
 					'x-rpc-device_id': this.deviceId,
 					'x-rpc-device_fp': this.deviceFp,
-					'User-Agent': `Mozilla/5.0 (iPhone; CPU iPhone OS 14_0_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) miHoYoBBS/${mys.APP_VERSION}`,
+					'User-Agent': `Mozilla/5.0 (Linux; Android ${this.deviceProfile?.androidVersion || '13'}; ${this.deviceProfile?.deviceModel || 'Android'} Build/${this.deviceProfile?.deviceFingerprint?.split('/')[3] || 'release'}; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/111.0.5563.116 Mobile Safari/537.36 miHoYoBBS/${mys.APP_VERSION}`,
 					Referer: board?.url || "https://bbs.mihoyo.com/",
 					Host: 'api-takumi.mihoyo.com',
 					'x-rpc-channel': 'appstore',
@@ -291,7 +372,7 @@ export default class miHoYoApi {
 					'x-rpc-device_id': this.deviceId,
 					'x-rpc-device_fp': this.deviceFp,
 					'x-rpc-device_name': this.deviceName,
-					'x-rpc-device_model': 'Mi 10',
+					'x-rpc-device_model': this.deviceProfile?.deviceModel || 'Android',
 					Host: 'api-takumi.mihoyo.com'
 				}
 				if (this.isOs) {
@@ -311,7 +392,8 @@ export default class miHoYoApi {
 				break;
 			case "stoken":
 				header = {
-					"x-rpc-device_id": "zxcvbnmasadfghjk123456",
+					"x-rpc-device_id": this.deviceId,
+					"x-rpc-device_fp": this.deviceFp,
 					"Content-Type": "application/json;charset=UTF-8",
 					"x-rpc-client_type": "",
 					"x-rpc-app_version": "",
@@ -348,12 +430,12 @@ export default class miHoYoApi {
 					'x-rpc-device_id': this.deviceId,
 					'x-rpc-device_fp': this.deviceFp,
 					'x-rpc-device_name': this.deviceName,
-					'x-rpc-device_model': this.deviceName,
+					'x-rpc-device_model': this.deviceProfile?.deviceModel || this.deviceName,
 					'x-rpc-app_id': 'bll8iq97cem8',
 					'x-rpc-app_version': mys.APP_VERSION,
 					'x-rpc-client_type': '2',
 					'x-rpc-game_biz': 'bbs_cn',
-					'x-rpc-sys_version': '11',
+					'x-rpc-sys_version': this.deviceProfile?.androidVersion || '13',
 					'Content-Type': 'application/json',
 					'DS': this.getDs2('', body, mys.passSalt),
 					'x-rpc-sdk_version': '1.3.1.2',
@@ -367,10 +449,10 @@ export default class miHoYoApi {
 					'x-rpc-app_id': "bll8iq97cem8",
 					'x-rpc-device_name': this.deviceName,
 					"x-rpc-device_fp": this.deviceFp,
-					"x-rpc-device_model": this.deviceName,
+					"x-rpc-device_model": this.deviceProfile?.deviceModel || this.deviceName,
 					'x-rpc-app_version': mys.APP_VERSION,
 					'x-rpc-game_biz': 'bbs_cn',
-					"x-rpc-sys_version": "11",
+					"x-rpc-sys_version": this.deviceProfile?.androidVersion || '13',
 					"Content-Type": "application/json;",
 					"x-rpc-client_type": "2",
 					"DS": this.getDs2('', body, mys.passSalt),
@@ -401,14 +483,6 @@ export default class miHoYoApi {
 				const matches = Object.entries(records).filter(([, v]) => String(v?.stuid) === String(stuid) && v?.stoken)
 				const sk = matches[0]?.[1]
 				if (!sk) return false
-				// 自动刷新时复用 MysUsers 中已持久化的 Device ID。
-				if (!this.e?.deviceId) {
-					try {
-						const { default: MysUser } = await import(`file://${_path}/plugins/genshin/model/mys/MysUser.js`)
-						const mysUser = await MysUser.create(stuid)
-						if (mysUser?.device) this.deviceId = this.e.deviceId = mysUser.device
-					} catch {}
-				}
 				const params = `uid=${encodeURIComponent(stuid)}&stoken=${encodeURIComponent(sk.stoken)}&mid=${encodeURIComponent(sk.mid || '')}`
 				const [ltokenRes, cookieRes] = await Promise.all([
 					this.getData('getLtoken', { cookies: params }, true),

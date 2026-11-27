@@ -489,19 +489,7 @@ export async function updCookie(e) {
 		const roleUid = String(record.uid || '');
 		e.uid = roleUid || '1';
 		e.region = roleUid ? getServer(roleUid) : 'cn_gf01';
-		// 刷新时优先复用绑定 CK 时持久化的设备身份，保持扫码与后续请求一致。
-		if (!e.deviceId) {
-			try {
-				const { default: MysUser } = await import(`file://${_path}/plugins/genshin/model/mys/MysUser.js`);
-				const mysUser = await MysUser.create(accountId);
-				if (mysUser?.device) e.deviceId = mysUser.device;
-			} catch (error) { Bot.logger.debug(`[刷新CK] 读取设备 ID 失败：${error.message}`); }
-		}
-		if (!e.deviceFp) {
-			try {
-				e.deviceFp = await redis.get(`genshin:device_fp:${accountId}:fp`) || await redis.get(`ZZZ:DEVICE_FP:${accountId}:FP`) || '38d805c20d53d';
-			} catch { e.deviceFp = '38d805c20d53d'; }
-		}
+		// 设备身份由 Genshin DeviceManager 根据当前 stuid 自动取得；不再读取 MysUser 或旧 Redis 键。
 		const mid = String(record.mid || '').trim();
 		if (!mid) {
 			e.reply(`账号:${accountId} 缺少 MID，无法生成完整 v2 CK。请重新扫码绑定以补齐 MID；原有 SK 已保留。`);
